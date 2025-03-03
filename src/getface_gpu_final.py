@@ -1,30 +1,38 @@
 # getface_gpu_final.py
 import os
 import sys
-import time
+import cv2
 import bz2
 import requests
-import cv2
 import numpy as np
-from tqdm import tqdm
 import concurrent.futures
+from tqdm import tqdm
 import argparse
-
-# 检查依赖库
-try:
-    import dlib
-    from deepface import DeepFace
-except ImportError as e:
-    print(f"缺少依赖库: {str(e)}")
-    sys.exit(1)
+import dlib
+from deepface import DeepFace
+import threading
 
 class FaceExtractor:
-    def __init__(self, output_dir="output"):
+    def __init__(self, output_root="output", anchor_name="anchor"):
         self.face_detector = dlib.get_frontal_face_detector()
         self.landmark_predictor = dlib.shape_predictor(self._download_model())
-        self.output_dir = output_dir
-        self.emotion_counts = {'happy':0, 'sad':0, 'neutral':0, 'angry':0, 'surprise':0}
-        os.makedirs(output_dir, exist_ok=True)
+        
+        self.output_dir = os.path.join(output_root, anchor_name)
+        self.emotion_dirs = {
+            'happy': os.path.join(self.output_dir, 'happy'),
+            'sad': os.path.join(self.output_dir, 'sad'),
+            'neutral': os.path.join(self.output_dir, 'neutral'),
+            'angry': os.path.join(self.output_dir, 'angry'),
+            'surprise': os.path.join(self.output_dir, 'surprise')
+        }
+        
+        os.makedirs(self.output_dir, exist_ok=True)
+        for dir_path in self.emotion_dirs.values():
+            os.makedirs(dir_path, exist_ok=True)
+            
+        self.emotion_limits = 20
+        self.emotion_counts = {e:0 for e in self.emotion_dirs.keys()}
+        self.lock = threading.Lock()  # 新增线程锁
 
     def _download_model(self):
         model_path = "shape_predictor_68_face_landmarks.dat"
@@ -58,103 +66,109 @@ class FaceExtractor:
                 sys.exit(1)
         return model_path
 
-    def _check_face_quality(self, frame, face_rect, landmarks):
-        quality = {"is_good": True, "reasons": []}
-        face_area = (face_rect.right() - face_rect.left()) * (face_rect.bottom() - face_rect.top())
-        img_area = frame.shape[0] * frame.shape[1]
-        
-        if face_area < img_area * 0.002:
-            quality["is_good"] = False
-            quality["reasons"].append("face_too_small")
-
-        jaw_points = [landmarks.part(i) for i in range(0, 17)]
-        for point in jaw_points:
-            if (point.x < 0 or point.x >= frame.shape[1] or 
-                point.y < 0 or point.y >= frame.shape[0]):
-                quality["is_good"] = False
-                quality["reasons"].append("face_out_of_frame")
-                break
-        return quality
+    def _fast_face_detect(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        return self.face_detector(gray, 1)
 
     def process_frame_batch(self, frames_data):
         results = []
         for frame_idx, frame in frames_data:
             try:
-                faces = self.face_detector(frame, 1)
-                if len(faces) > 0:
-                    main_face = max(faces, key=lambda rect: (rect.right()-rect.left())*(rect.bottom()-rect.top()))
+                faces = self._fast_face_detect(frame)
+                if faces:
+                    main_face = max(faces, key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
                     landmarks = self.landmark_predictor(frame, main_face)
                     
-                    if self._check_face_quality(frame, main_face, landmarks)["is_good"]:
-                        height, width = frame.shape[:2]
-                        y1 = max(0, main_face.top() - int(main_face.height() * 0.3))
-                        y2 = min(height, main_face.bottom() + int(main_face.height() * 0.1))
-                        x1 = max(0, main_face.left() - int(main_face.width() * 0.1))
-                        x2 = min(width, main_face.right() + int(main_face.width() * 0.1))  # 修复的括号
+                    height, width = frame.shape[:2]
+                    face_area = (main_face.right()-main_face.left())*(main_face.bottom()-main_face.top())
+                    if face_area < (width*height)*0.002:
+                        continue
                         
-                        face_img = frame[y1:y2, x1:x2]
+                    y1 = max(0, main_face.top() - int(main_face.height() * 0.3))
+                    y2 = min(height, main_face.bottom() + int(main_face.height() * 0.1))
+                    x1 = max(0, main_face.left() - int(main_face.width() * 0.1))
+                    x2 = min(width, main_face.right() + int(main_face.width() * 0.1))
+                    face_img = frame[y1:y2, x1:x2]
+                    
+                    try:
+                        analysis = DeepFace.analyze(
+                            img_path=face_img, 
+                            actions=['emotion'],
+                            enforce_detection=False,
+                            detector_backend='skip',
+                            silent=True
+                        )
+                        emotion = analysis[0]['dominant_emotion']
+                        emotion = 'surprise' if emotion in ['fear', 'disgust'] else emotion
+                        emotion = emotion if emotion in self.emotion_counts else 'neutral'
                         
-                        try:
-                            analysis = DeepFace.analyze(
-                                img_path=face_img, actions=['emotion'],
-                                enforce_detection=False, detector_backend='skip', silent=True
-                            )
-                            if isinstance(analysis, list) and len(analysis) > 0:
-                                emotion = analysis[0]['dominant_emotion']
-                                emotion = 'surprise' if emotion in ['fear', 'disgust'] else \
-                                         ('neutral' if emotion not in self.emotion_counts else emotion)
-                                
-                                if self.emotion_counts[emotion] < 20:
-                                    self.emotion_counts[emotion] += 1
-                                    results.append((frame_idx, face_img, emotion))
-                        except Exception as e:
-                            pass
+                        # 使用线程锁控制计数
+                        with self.lock:
+                            if self.emotion_counts[emotion] < self.emotion_limits:
+                                self.emotion_counts[emotion] += 1
+                                results.append((frame_idx, face_img, emotion))
+                            else:
+                                continue  # 超过上限直接跳过
+                    except Exception as e:
+                        pass
             except Exception as e:
                 print(f"处理帧 {frame_idx} 时出错: {str(e)}")
         return results
 
-    def process_video(self, video_path, num_workers=4):
-        print("\n开始处理视频...")
+    def process_video(self, video_path, num_workers=8):
+        print("\n开始加速处理视频...")
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        batch_size = 32
+        frame_skip = 3
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = []
             batch = []
             
-            for frame_idx in tqdm(range(total_frames), desc="处理进度"):
+            for frame_idx in tqdm(range(total_frames), desc="帧处理"):
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                if frame_idx % 5 == 0:  # 间隔采样
+                if frame_idx % frame_skip == 0:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     batch.append((frame_idx, frame))
                     
-                    if len(batch) >= 8:
+                    if len(batch) >= batch_size:
                         futures.append(executor.submit(self.process_frame_batch, batch.copy()))
                         batch.clear()
             
             if batch:
                 futures.append(executor.submit(self.process_frame_batch, batch))
             
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="保存结果"):
-                for frame_idx, face_img, emotion in future.result():
-                    emotion_dir = os.path.join(self.output_dir, emotion)
-                    os.makedirs(emotion_dir, exist_ok=True)
-                    cv2.imwrite(os.path.join(emotion_dir, f"frame_{frame_idx}.jpg"), 
-                               cv2.cvtColor(face_img, cv2.COLOR_RGB2BGR))
+            # 确保所有结果按顺序处理
+            with tqdm(total=len(futures), desc="结果保存") as pbar:
+                for future in concurrent.futures.as_completed(futures):
+                    batch_results = future.result()
+                    for frame_idx, face_img, emotion in batch_results:
+                        output_path = os.path.join(self.emotion_dirs[emotion], f"{frame_idx}.jpg")
+                        try:
+                            cv2.imwrite(
+                                output_path,
+                                cv2.cvtColor(face_img, cv2.COLOR_RGB2BGR)
+                            )
+                        except Exception as e:
+                            print(f"保存 {output_path} 失败: {str(e)}")
+                    pbar.update(1)
         
         cap.release()
-        print("\n处理完成！各表情样本数量：")
+        print("\n最终统计：")
         for emotion, count in self.emotion_counts.items():
             print(f"{emotion}: {count}张")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", required=True, help="输入视频路径")
-    parser.add_argument("--workers", type=int, default=4, help="并行工作线程数")
+    parser.add_argument("--video", required=True, help="输入视频路径（示例：test.mp4）")
+    parser.add_argument("--anchor", required=True, help="主播名称（示例：张三）")
+    parser.add_argument("--workers", type=int, default=8, help="并行线程数（建议值：8-16）")
     args = parser.parse_args()
     
-    extractor = FaceExtractor()
+    extractor = FaceExtractor(anchor_name=args.anchor)
     extractor.process_video(args.video, num_workers=args.workers)
